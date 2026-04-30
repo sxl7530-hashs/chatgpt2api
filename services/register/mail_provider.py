@@ -18,6 +18,8 @@ from curl_cffi import requests as curl_requests
 ResultT = TypeVar("ResultT")
 domain_lock = Lock()
 provider_lock = Lock()
+cooldown_lock = Lock()
+provider_cooldowns: dict[str, float] = {}
 domain_index = 0
 provider_index = 0
 
@@ -26,7 +28,9 @@ def _config(mail_config: dict) -> dict:
     return {
         "request_timeout": float(mail_config.get("request_timeout") or 30),
         "wait_timeout": float(mail_config.get("wait_timeout") or 30),
-        "wait_interval": float(mail_config.get("wait_interval") or 2),
+        "wait_interval": float(mail_config.get("wait_interval") or 3),
+        "rate_limit_cooldown": max(1.0, float(mail_config.get("rate_limit_cooldown") or 5)),
+        "rate_limit_retries": max(0, int(mail_config.get("rate_limit_retries") or 5)),
         "user_agent": str(mail_config.get("user_agent") or "Mozilla/5.0"),
     }
 
@@ -50,6 +54,40 @@ def _next_domain(domains: list[str]) -> str:
         value = domains[domain_index % len(domains)]
         domain_index = (domain_index + 1) % len(domains)
         return value
+
+
+def _cooldown_key(provider: str, provider_ref: str = "") -> str:
+    return f"{provider}:{provider_ref or provider}"
+
+
+def _wait_for_cooldown(provider: str, provider_ref: str = "") -> None:
+    key = _cooldown_key(provider, provider_ref)
+    while True:
+        with cooldown_lock:
+            resume_at = provider_cooldowns.get(key, 0.0)
+        wait_seconds = resume_at - time.monotonic()
+        if wait_seconds <= 0:
+            return
+        time.sleep(min(wait_seconds, 5.0))
+
+
+def _set_cooldown(provider: str, provider_ref: str, seconds: float) -> float:
+    wait_seconds = max(1.0, float(seconds or 1))
+    resume_at = time.monotonic() + wait_seconds
+    key = _cooldown_key(provider, provider_ref)
+    with cooldown_lock:
+        provider_cooldowns[key] = max(provider_cooldowns.get(key, 0.0), resume_at)
+    return wait_seconds
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return max(1.0, float(text))
+    except ValueError:
+        return None
 
 
 def _parse_received_at(value: Any) -> datetime | None:
@@ -262,13 +300,22 @@ class TempMailLolProvider(BaseMailProvider):
         return text, False
 
     def _request(self, method: str, path: str, params: dict | None = None, payload: dict | None = None, expected: tuple[int, ...] = (200,)):
-        resp = self.session.request(method.upper(), f"https://api.tempmail.lol/v2{path}", params=params, json=payload, timeout=self.conf["request_timeout"], verify=False)
-        if resp.status_code not in expected:
-            raise RuntimeError(f"TempMail.lol 请求失败: {method} {path}, HTTP {resp.status_code}, body={resp.text[:300]}")
-        data = resp.json()
-        if not isinstance(data, dict):
-            raise RuntimeError(f"TempMail.lol {method} {path} 返回结构不是对象")
-        return data
+        attempts = int(self.conf["rate_limit_retries"]) + 1
+        for attempt in range(1, attempts + 1):
+            _wait_for_cooldown(self.name, self.provider_ref)
+            resp = self.session.request(method.upper(), f"https://api.tempmail.lol/v2{path}", params=params, json=payload, timeout=self.conf["request_timeout"], verify=False)
+            if resp.status_code == 429 and attempt < attempts:
+                wait_seconds = _retry_after_seconds(resp.headers.get("Retry-After")) or float(self.conf["rate_limit_cooldown"])
+                wait_seconds = _set_cooldown(self.name, self.provider_ref, wait_seconds)
+                print(f"[mail-provider] TempMail.lol rate limited, cooling down {wait_seconds:.0f}s before retry {attempt}/{attempts - 1}")
+                continue
+            if resp.status_code not in expected:
+                raise RuntimeError(f"TempMail.lol 请求失败: {method} {path}, HTTP {resp.status_code}, body={resp.text[:300]}")
+            data = resp.json()
+            if not isinstance(data, dict):
+                raise RuntimeError(f"TempMail.lol {method} {path} 返回结构不是对象")
+            return data
+        raise RuntimeError(f"TempMail.lol 请求失败: {method} {path}, HTTP 429, body=rate limited after retries")
 
     def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
         payload: dict[str, Any] = {}

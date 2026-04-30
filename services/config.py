@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 import time
@@ -111,6 +113,30 @@ class ConfigStore:
             return 30
 
     @property
+    def image_retention_minutes(self) -> int | None:
+        value = self.data.get("image_retention_minutes")
+        if value in (None, ""):
+            return None
+        try:
+            return max(1, int(value))
+        except (TypeError, ValueError):
+            return None
+
+    @property
+    def image_cleanup_interval_minutes(self) -> int:
+        try:
+            return max(1, int(self.data.get("image_cleanup_interval_minutes", 40)))
+        except (TypeError, ValueError):
+            return 40
+
+    @property
+    def empty_trash_on_image_cleanup(self) -> bool:
+        value = self.data.get("empty_trash_on_image_cleanup", False)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    @property
     def auto_remove_invalid_accounts(self) -> bool:
         value = self.data.get("auto_remove_invalid_accounts", False)
         if isinstance(value, str):
@@ -139,18 +165,59 @@ class ConfigStore:
         return path
 
     def cleanup_old_images(self) -> int:
-        cutoff = time.time() - self.image_retention_days * 86400
+        retention_minutes = self.image_retention_minutes
+        retention_seconds = retention_minutes * 60 if retention_minutes is not None else self.image_retention_days * 86400
+        cutoff = time.time() - retention_seconds
         removed = 0
         for path in self.images_dir.rglob("*"):
-            if path.is_file() and path.stat().st_mtime < cutoff:
-                path.unlink()
-                removed += 1
+            try:
+                if path.is_file() and path.stat().st_mtime < cutoff:
+                    path.unlink()
+                    removed += 1
+            except OSError:
+                pass
         for path in sorted((p for p in self.images_dir.rglob("*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
             try:
                 path.rmdir()
             except OSError:
                 pass
         return removed
+
+    def empty_user_trash(self) -> int:
+        trash_dir = Path.home() / ".Trash"
+        if not trash_dir.exists() or not trash_dir.is_dir():
+            return 0
+        removed = 0
+        try:
+            trash_items = list(trash_dir.iterdir())
+        except OSError as exc:
+            try:
+                subprocess.run(
+                    ["osascript", "-e", 'tell application "Finder" to empty trash'],
+                    check=False,
+                    timeout=30,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception as fallback_exc:
+                print(f"[image-cleanup] failed to empty trash via Finder: {fallback_exc}")
+            print(f"[image-cleanup] failed to access trash directory {trash_dir}: {exc}")
+            return 0
+        for path in trash_items:
+            try:
+                if path.is_dir() and not path.is_symlink():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+                removed += 1
+            except OSError as exc:
+                print(f"[image-cleanup] failed to remove trash item {path}: {exc}")
+        return removed
+
+    def cleanup_generated_images(self) -> tuple[int, int]:
+        removed_images = self.cleanup_old_images()
+        removed_trash_items = self.empty_user_trash() if self.empty_trash_on_image_cleanup else 0
+        return removed_images, removed_trash_items
 
     @property
     def base_url(self) -> str:
@@ -159,6 +226,15 @@ class ConfigStore:
             or self.data.get("base_url")
             or ""
         ).strip().rstrip("/")
+
+    @property
+    def openai_api_key(self) -> str:
+        return str(
+            os.getenv("CHATGPT2API_OPENAI_API_KEY")
+            or os.getenv("OPENAI_API_KEY")
+            or self.data.get("openai_api_key")
+            or ""
+        ).strip()
 
     @property
     def app_version(self) -> str:
@@ -172,10 +248,14 @@ class ConfigStore:
         data = dict(self.data)
         data["refresh_account_interval_minute"] = self.refresh_account_interval_minute
         data["image_retention_days"] = self.image_retention_days
+        data["image_retention_minutes"] = self.image_retention_minutes
+        data["image_cleanup_interval_minutes"] = self.image_cleanup_interval_minutes
+        data["empty_trash_on_image_cleanup"] = self.empty_trash_on_image_cleanup
         data["auto_remove_invalid_accounts"] = self.auto_remove_invalid_accounts
         data["auto_remove_rate_limited_accounts"] = self.auto_remove_rate_limited_accounts
         data["log_levels"] = self.log_levels
         data.pop("auth-key", None)
+        data.pop("openai_api_key", None)
         return data
 
     def get_proxy_settings(self) -> str:

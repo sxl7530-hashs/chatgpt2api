@@ -300,7 +300,11 @@ class OpenAIBackendAPI:
         return response.json().get("conduit_token", "")
 
     def _decode_image_base64(self, image: str) -> bytes:
-        """把 base64 图片字符串或本地路径解码成二进制。"""
+        """把 URL、base64 图片字符串或本地路径解码成二进制。"""
+        if image.startswith(("http://", "https://")):
+            response = requests.get(image, timeout=60)
+            ensure_ok(response, "image_url_download")
+            return response.content
         if (
                 image
                 and len(image) < 512
@@ -315,7 +319,7 @@ class OpenAIBackendAPI:
         return base64.b64decode(payload)
 
     def _upload_image(self, image: str, file_name: str = "image.png") -> Dict[str, Any]:
-        """上传一张 base64 图片，返回底层文件元数据。"""
+        """上传一张 URL/base64 图片，返回底层文件元数据。"""
         data = self._decode_image_base64(image)
         if (
                 image
@@ -669,6 +673,21 @@ class OpenAIBackendAPI:
         if not self.access_token:
             raise RuntimeError("access_token is required for image endpoints")
         references = [self._upload_image(image, f"image_{idx}.png") for idx, image in enumerate(images, start=1)]
+        if references:
+            logger.info({
+                "event": "image_references_uploaded",
+                "count": len(references),
+                "items": [
+                    {
+                        "file_id": item.get("file_id"),
+                        "mime_type": item.get("mime_type"),
+                        "width": item.get("width"),
+                        "height": item.get("height"),
+                        "file_size": item.get("file_size"),
+                    }
+                    for item in references
+                ],
+            })
         self._bootstrap()
         requirements = self._get_chat_requirements()
         conduit_token = self._prepare_image_conversation(prompt, requirements, model)

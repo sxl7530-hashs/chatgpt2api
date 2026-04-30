@@ -98,6 +98,27 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
     return thread
 
 
+def start_image_cleanup_watcher(stop_event: Event) -> Thread:
+    interval_seconds = config.image_cleanup_interval_minutes * 60
+
+    def worker() -> None:
+        while not stop_event.is_set():
+            try:
+                removed_images, removed_trash_items = config.cleanup_generated_images()
+                if removed_images or removed_trash_items:
+                    print(
+                        f"[image-cleanup] removed {removed_images} generated images "
+                        f"and {removed_trash_items} trash items"
+                    )
+            except Exception as exc:
+                print(f"[image-cleanup] fail {exc}")
+            stop_event.wait(interval_seconds)
+
+    thread = Thread(target=worker, name="image-cleanup-watcher", daemon=True)
+    thread.start()
+    return thread
+
+
 def resolve_web_asset(requested_path: str) -> Path | None:
     if not WEB_DIST_DIR.exists():
         return None

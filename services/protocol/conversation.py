@@ -62,8 +62,18 @@ def image_stream_error_message(message: str) -> str:
     return text or "image generation failed"
 
 
-def encode_images(images: Iterable[tuple[bytes, str, str]]) -> list[str]:
-    return [base64.b64encode(data).decode("ascii") for data, _, _ in images if data]
+def encode_images(images: Iterable[tuple[bytes, str, str] | str]) -> list[str]:
+    encoded: list[str] = []
+    for image in images:
+        if isinstance(image, str):
+            value = image.strip()
+            if value:
+                encoded.append(value)
+            continue
+        data, _, _ = image
+        if data:
+            encoded.append(base64.b64encode(data).decode("ascii"))
+    return encoded
 
 
 def save_image_bytes(image_data: bytes, base_url: str | None = None) -> str:
